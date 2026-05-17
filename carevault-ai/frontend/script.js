@@ -5,6 +5,177 @@
 
 'use strict';
 
+const API_HOST = window.location.protocol === 'file:'
+  ? '127.0.0.1'
+  : window.location.hostname || '127.0.0.1';
+const API_BASE_URLS = window.location.port === '5000'
+  ? ['/api']
+  : Array.from(new Set([
+      `http://${API_HOST}:5000/api`,
+      'http://127.0.0.1:5000/api',
+      'http://localhost:5000/api',
+    ]));
+
+function getAuthToken() {
+  return sessionStorage.getItem('cv_token') || localStorage.getItem('cv_token') || '';
+}
+
+function setAuthToken(token) {
+  if (token) sessionStorage.setItem('cv_token', token);
+}
+
+async function ensureAuthToken() {
+  const existingToken = getAuthToken();
+  if (existingToken) return existingToken;
+
+  const user = getCurrentUser();
+  if (!user || !user.username || !user.password) {
+    throw new Error('Please log out and log in again before using backend features.');
+  }
+
+  try {
+    const data = await apiLogin(user.username, user.password);
+    setAuthToken(data.token);
+    return data.token;
+  } catch (error) {
+    const data = await apiSignup(user);
+    setAuthToken(data.token);
+    return data.token;
+  }
+}
+
+function normalizeRecord(record) {
+  return {
+    ...record,
+    id: record.id || record._id,
+  };
+}
+
+function fileUrl(file) {
+  if (!file) return "";
+  const rawPath = typeof file === "object" ? file.path : "";
+  if (!rawPath) return "";
+  return window.location.port === "5000" ? rawPath : `http://${API_HOST}:5000${rawPath}`;
+}
+
+async function apiRequest(path, options = {}) {
+  let lastError;
+
+  for (const baseUrl of API_BASE_URLS) {
+    try {
+      const response = await fetch(`${baseUrl}${path}`, options);
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data.message || 'Request failed');
+      }
+
+      return data;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(lastError?.message || 'Could not connect to backend');
+}
+
+async function apiLogin(username, password) {
+  return apiRequest('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+async function apiSignup(user) {
+  return apiRequest('/auth/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(user),
+  });
+}
+
+async function apiGetRecords(username) {
+  const data = await apiRequest(`/records/${encodeURIComponent(username)}?limit=100`);
+  return (data.records || []).map(normalizeRecord);
+}
+
+async function apiCreateRecord(recordData, file) {
+  const token = await ensureAuthToken();
+
+  const formData = new FormData();
+  Object.entries(recordData).forEach(([key, value]) => {
+    formData.append(key, value);
+  });
+  if (file) formData.append('file', file);
+
+  const data = await apiRequest('/records', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+
+  return normalizeRecord(data.record);
+}
+
+function recordKey(record) {
+  const parsedDate = new Date(record.date);
+  const dateKey = Number.isNaN(parsedDate.getTime())
+    ? String(record.date || '')
+    : parsedDate.toISOString().slice(0, 10);
+
+  return [
+    record.username,
+    record.title,
+    record.type,
+    dateKey,
+  ].join('|').toLowerCase();
+}
+
+async function migrateLocalRecordsToBackend(username, backendRecords) {
+  const backendKeys = new Set(backendRecords.map(recordKey));
+  const localRecords = getRecords().filter(record => {
+    const isForUser = record.username === username;
+    const isLocalOnly = !record._id && !/^[a-f\d]{24}$/i.test(String(record.id || ''));
+    return isForUser && isLocalOnly && !backendKeys.has(recordKey(record));
+  });
+
+  if (!localRecords.length) return backendRecords;
+
+  const migratedRecords = [];
+  for (const record of localRecords) {
+    migratedRecords.push(await apiCreateRecord({
+      username: record.username,
+      title: record.title,
+      type: record.type,
+      date: record.date,
+      doctor: record.doctor || 'Not specified',
+      description: record.description,
+    }, null));
+  }
+
+  return [...backendRecords, ...migratedRecords];
+}
+
+async function refreshRecordsFromBackend(username) {
+  try {
+    await ensureAuthToken();
+    const backendRecords = await migrateLocalRecordsToBackend(
+      username,
+      await apiGetRecords(username)
+    );
+    const otherRecords = getRecords().filter(r => r.username !== username);
+    saveRecords([...otherRecords, ...backendRecords]);
+    refreshPatientStats(username);
+    renderRecentRecords(username);
+    renderHealthTags(username);
+    renderRecordsGrid(username);
+    renderTimeline(username);
+  } catch (error) {
+    console.warn('Could not load records from backend:', error.message);
+  }
+}
+
 /* ─────────────────────────────────────────────
    INITIAL DEMO DATA SEED
 ───────────────────────────────────────────── */
@@ -202,7 +373,7 @@ function fillDemo(username, password) {
 /* ─────────────────────────────────────────────
    LOGIN
 ───────────────────────────────────────────── */
-function handleLogin() {
+async function handleLogin() {
   const username = document.getElementById('login-username').value.trim();
   const password = document.getElementById('login-password').value;
   const errEl = document.getElementById('login-error');
@@ -212,10 +383,32 @@ function handleLogin() {
     showError(errEl, 'Please fill in all fields.');
     return;
   }
-  const user = getUsers().find(u => u.username === username && u.password === password);
-  if (!user) {
-    showError(errEl, 'Invalid username or password.');
-    return;
+  let user;
+  try {
+    const data = await apiLogin(username, password);
+    user = data.user;
+    setAuthToken(data.token);
+
+    const users = getUsers();
+    if (!users.some(u => u.username === user.username)) {
+      users.push({ ...user, password });
+      saveUsers(users);
+    }
+  } catch (error) {
+    const localUser = getUsers().find(u => u.username === username && u.password === password);
+    if (!localUser) {
+      showError(errEl, error.message || 'Invalid username or password.');
+      return;
+    }
+
+    try {
+      const data = await apiSignup(localUser);
+      user = data.user;
+      setAuthToken(data.token);
+    } catch (signupError) {
+      showError(errEl, signupError.message || error.message || 'Invalid username or password.');
+      return;
+    }
   }
   setCurrentUser(user);
   showToast(`Welcome back, ${user.name}! 👋`, 'success');
@@ -232,7 +425,7 @@ function handleLogin() {
 /* ─────────────────────────────────────────────
    SIGNUP
 ───────────────────────────────────────────── */
-function handleSignup() {
+async function handleSignup() {
   const name     = document.getElementById('signup-name').value.trim();
   const username = document.getElementById('signup-username').value.trim();
   const email    = document.getElementById('signup-email').value.trim();
@@ -255,12 +448,20 @@ function handleSignup() {
   if (password.length < 8 || !/[A-Z]/.test(password) || !/[0-9]/.test(password) || !/[^A-Za-z0-9]/.test(password)) {
     showError(errEl, 'Password must be 8+ chars with uppercase, number, and symbol.'); return;
   }
-  const users = getUsers();
-  if (users.some(u => u.username === username)) {
-    showError(errEl, 'Username already taken. Please choose another.'); return;
+  try {
+    const data = await apiSignup({ username, password, name, email, role });
+    setAuthToken(data.token);
+
+    const users = getUsers();
+    if (!users.some(u => u.username === username)) {
+      users.push({ username, password, name, email, role });
+      saveUsers(users);
+    }
+  } catch (error) {
+    showError(errEl, error.message || 'Signup failed.');
+    return;
   }
-  users.push({ username, password, name, email, role });
-  saveUsers(users);
+
   okEl.textContent = '✓ Account created successfully! Redirecting to login...';
   okEl.classList.remove('hidden');
   setTimeout(() => {
@@ -290,6 +491,7 @@ function handleForgot() {
 ───────────────────────────────────────────── */
 function handleLogout() {
   sessionStorage.removeItem('cv_current');
+  sessionStorage.removeItem('cv_token');
   showToast('Logged out successfully.', 'success');
   showPage('page-landing');
 }
@@ -314,6 +516,7 @@ function initPatientDashboard(user) {
   renderHealthTags(user.username);
   renderRecordsGrid(user.username);
   renderTimeline(user.username);
+  refreshRecordsFromBackend(user.username);
 }
 
 function refreshPatientStats(username) {
@@ -376,12 +579,14 @@ function filterRecords() {
 }
 
 function recordCardHTML(r, showPatient = false) {
-  const isCritical = isCriticalRecord(r);
+  const risk = getRecordRisk(r);
+  const isCritical = risk.level === 'critical';
+  const hasFile = Boolean(r.file);
   return `
     <div class="record-card glass-card ${isCritical ? 'critical' : ''}" onclick="openRecordModal('${r.id}')">
       <div class="rc-top">
         <span class="rc-type-badge ${typeBadgeClass(r.type)}">${r.type}</span>
-        ${isCritical ? '<span class="rc-critical-badge"><i class="fa-solid fa-triangle-exclamation"></i> Critical</span>' : ''}
+        <span class="rc-risk-badge risk-${risk.level}"><i class="${risk.icon}"></i> ${risk.label}</span>
       </div>
       <div class="rc-title">${r.title}</div>
       <div class="rc-desc">${r.description}</div>
@@ -389,6 +594,7 @@ function recordCardHTML(r, showPatient = false) {
         <span class="rc-meta-date"><i class="fa-regular fa-calendar"></i> ${formatDate(r.date)}</span>
         ${showPatient ? `<span class="rc-patient-name"><i class="fa-solid fa-user"></i> ${getPatientName(r.username)}</span>` : `<span>${r.doctor || ''}</span>`}
       </div>
+      ${hasFile ? '<div class="rc-file-hint"><i class="fa-solid fa-paperclip"></i> Report attached</div>' : ''}
     </div>
   `;
 }
@@ -456,7 +662,7 @@ function removeFile() {
 /* ─────────────────────────────────────────────
    UPLOAD RECORD
 ───────────────────────────────────────────── */
-function handleUploadRecord() {
+async function handleUploadRecord() {
   const user = getCurrentUser();
   const title  = document.getElementById('upload-title').value.trim();
   const type   = document.getElementById('upload-type').value;
@@ -468,24 +674,30 @@ function handleUploadRecord() {
   okEl.classList.add('hidden');
   errEl.classList.add('hidden');
 
-  if (!title || !type || !date || !desc) {
-    showError(errEl, 'Please fill in all required fields (title, type, date, description).'); return;
+  if (!title || !type || !date) {
+    showError(errEl, 'Please fill in title, type, and date.'); return;
   }
 
-  const record = {
-    id: 'r' + Date.now(),
-    username: user.username,
-    title, type, date, doctor,
-    description: desc,
-    file: selectedFile ? selectedFile.name : null,
-    createdAt: new Date().toISOString()
-  };
+  let record;
+  try {
+    record = await apiCreateRecord({
+      username: user.username,
+      title,
+      type,
+      date,
+      doctor: doctor || 'Not specified',
+      description: desc || 'Uploaded medical record awaiting detailed notes.',
+    }, selectedFile);
 
-  const records = getRecords();
-  records.push(record);
-  saveRecords(records);
+    const records = getRecords().filter(r => r.id !== record.id);
+    records.push(record);
+    saveRecords(records);
+  } catch (error) {
+    showError(errEl, error.message || 'Record upload failed.');
+    return;
+  }
 
-  okEl.textContent = '✓ Record uploaded successfully!';
+  okEl.textContent = 'Record uploaded successfully!';
   okEl.classList.remove('hidden');
   showToast(`Record "${title}" saved!`, 'success');
 
@@ -516,7 +728,8 @@ function openRecordModal(recordId) {
   if (!r) return;
 
   const user = getCurrentUser();
-  const isCritical = isCriticalRecord(r);
+  const risk = getRecordRisk(r);
+  const isCritical = risk.level === 'critical';
 
   const patientName = getPatientName(r.username);
   const showPatientRow = user && user.role === 'doctor' ? `
@@ -529,16 +742,20 @@ function openRecordModal(recordId) {
     <button class="modal-delete-btn" onclick="deleteRecord('${r.id}')">
       <i class="fa-solid fa-trash"></i> Delete Record
     </button>` : '';
+  const fileLabel = r.file && typeof r.file === 'object'
+    ? (r.file.originalName || r.file.filename)
+    : r.file;
+  const attachmentUrl = fileUrl(r.file);
 
   document.getElementById('modal-content').innerHTML = `
     <span class="rc-type-badge modal-record-type ${typeBadgeClass(r.type)}">${r.type}</span>
-    ${isCritical ? '<span class="rc-critical-badge" style="display:inline-flex;margin-left:8px;"><i class="fa-solid fa-triangle-exclamation"></i> Critical Attention Required</span>' : ''}
+    <span class="rc-risk-badge risk-${risk.level}" style="display:inline-flex;margin-left:8px;"><i class="${risk.icon}"></i> ${risk.label}</span>
     <h2 class="modal-title">${r.title}</h2>
     <p class="modal-date"><i class="fa-regular fa-calendar"></i> ${formatDate(r.date)}${r.doctor ? ' &nbsp;·&nbsp; <i class="fa-solid fa-stethoscope"></i> ' + r.doctor : ''}</p>
     ${showPatientRow}
     <p class="modal-desc-label">Description / Findings</p>
     <div class="modal-desc">${r.description.replace(/\n/g, '<br>')}</div>
-    ${r.file ? `<button class="modal-file-btn"><i class="fa-solid fa-paperclip"></i> Attached: ${r.file}</button>` : ''}
+    ${fileLabel ? `<button class="modal-file-btn" onclick="${attachmentUrl ? `window.open('${attachmentUrl}', '_blank')` : ''}"><i class="fa-solid fa-file-medical"></i> View Report: ${fileLabel}</button>` : ''}
     ${deleteBtn}
   `;
 
@@ -570,12 +787,30 @@ function deleteRecord(recordId) {
 /* ─────────────────────────────────────────────
    AI INSIGHTS ENGINE
 ───────────────────────────────────────────── */
-function runAIAnalysis() {
+async function runAIAnalysis() {
   const user = getCurrentUser();
-  const records = getUserRecords(user.username);
   const emptyEl   = document.getElementById('insights-empty');
   const loaderEl  = document.getElementById('insights-loader');
   const container = document.getElementById('insights-container');
+
+  let records = getUserRecords(user.username);
+
+  try {
+    await ensureAuthToken();
+    records = await migrateLocalRecordsToBackend(
+      user.username,
+      await apiGetRecords(user.username)
+    );
+    const otherRecords = getRecords().filter(r => r.username !== user.username);
+    saveRecords([...otherRecords, ...records]);
+    refreshPatientStats(user.username);
+    renderRecentRecords(user.username);
+    renderRecordsGrid(user.username);
+    renderTimeline(user.username);
+    renderHealthTags(user.username);
+  } catch (error) {
+    showToast(`Could not load records from MongoDB: ${error.message}`, 'error');
+  }
 
   if (!records.length) {
     showToast('Upload some records first to get AI insights.', 'error'); return;
@@ -756,6 +991,73 @@ function insightCardHTML(ins) {
   `;
 }
 
+function exportHealthSummary() {
+  const user = getCurrentUser();
+  if (!user) return;
+
+  const records = getUserRecords(user.username).sort((a, b) => new Date(b.date) - new Date(a.date));
+  if (!records.length) {
+    showToast('No records available to export.', 'error');
+    return;
+  }
+
+  const insights = generateAIInsights(records);
+  const riskCounts = records.reduce((acc, record) => {
+    const risk = getRecordRisk(record).level;
+    acc[risk] = (acc[risk] || 0) + 1;
+    return acc;
+  }, {});
+
+  const reportWindow = window.open('', '_blank');
+  if (!reportWindow) {
+    showToast('Allow pop-ups to export the summary.', 'error');
+    return;
+  }
+
+  reportWindow.document.write(`
+    <html>
+      <head>
+        <title>CareVault Health Summary - ${user.name}</title>
+        <style>
+          body { font-family: Arial, sans-serif; color: #172033; padding: 32px; line-height: 1.5; }
+          h1 { margin-bottom: 4px; }
+          h2 { margin-top: 28px; border-bottom: 1px solid #d8dee9; padding-bottom: 6px; }
+          .meta { color: #667085; margin-bottom: 20px; }
+          .stats { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0; }
+          .stat { border: 1px solid #d8dee9; border-radius: 8px; padding: 10px 14px; }
+          .record { border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; margin: 10px 0; }
+          .risk { font-weight: 700; }
+          @media print { button { display: none; } body { padding: 0; } }
+        </style>
+      </head>
+      <body>
+        <button onclick="window.print()">Print / Save as PDF</button>
+        <h1>CareVault AI Health Summary</h1>
+        <div class="meta">Patient: ${user.name} (${user.username}) | Generated: ${formatDate(new Date().toISOString())}</div>
+        <div class="stats">
+          <div class="stat"><strong>${records.length}</strong><br/>Records</div>
+          <div class="stat"><strong>${riskCounts.critical || 0}</strong><br/>Critical</div>
+          <div class="stat"><strong>${riskCounts.high || 0}</strong><br/>High Risk</div>
+          <div class="stat"><strong>${riskCounts.medium || 0}</strong><br/>Medium Risk</div>
+        </div>
+        <h2>Records</h2>
+        ${records.map(record => {
+          const risk = getRecordRisk(record);
+          return `<div class="record">
+            <strong>${record.title}</strong> (${record.type})<br/>
+            Date: ${formatDate(record.date)} | Doctor: ${record.doctor || 'Not specified'}<br/>
+            Risk: <span class="risk">${risk.label}</span><br/>
+            ${record.description}
+          </div>`;
+        }).join('')}
+        <h2>AI Insights</h2>
+        ${insights.map(insight => `<div class="record"><strong>${insight.title}</strong><br/>${insight.summary}</div>`).join('')}
+      </body>
+    </html>
+  `);
+  reportWindow.document.close();
+}
+
 /* ─────────────────────────────────────────────
    DOCTOR DASHBOARD
 ───────────────────────────────────────────── */
@@ -863,8 +1165,25 @@ function detectHealthTags(records) {
 }
 
 function isCriticalRecord(r) {
-  const text = (r.description + ' ' + r.title).toLowerCase();
-  return /critical|emergency|urgent|severe|dengue|platelet.*6[0-5]|bp.*16|hypertension|chest pain|stroke|cardiac|cardiomegaly|hba1c.*[89]|high fever|104/.test(text);
+  return getRecordRisk(r).level === 'critical';
+}
+
+function getRecordRisk(r) {
+  const text = `${r.description || ''} ${r.title || ''}`.toLowerCase();
+
+  if (/critical|emergency|urgent|severe|platelet.*6[0-5]|stroke|chest pain|cardiac arrest|high fever|104/.test(text)) {
+    return { level: 'critical', label: 'Critical', icon: 'fa-solid fa-triangle-exclamation' };
+  }
+
+  if (/hypertension|bp.*16|hba1c.*[89]|cholesterol.*2[4-9]|ldl.*1[6-9]|cardiomegaly|dengue|diabetes|high glucose/.test(text)) {
+    return { level: 'high', label: 'High Risk', icon: 'fa-solid fa-circle-exclamation' };
+  }
+
+  if (/borderline|mild|slightly elevated|low|abnormal|deficiency|thyroid|anemia|fatigue|dizziness/.test(text)) {
+    return { level: 'medium', label: 'Medium Risk', icon: 'fa-solid fa-arrow-trend-up' };
+  }
+
+  return { level: 'low', label: 'Low Risk', icon: 'fa-solid fa-shield-heart' };
 }
 
 function getPatientName(username) {
@@ -874,7 +1193,8 @@ function getPatientName(username) {
 
 function formatDate(dateStr) {
   if (!dateStr) return '';
-  const d = new Date(dateStr + 'T00:00:00');
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return '';
   return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 

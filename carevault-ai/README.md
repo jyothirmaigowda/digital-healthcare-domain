@@ -10,7 +10,7 @@
 1. Open the `frontend/` folder in VS Code
 2. Right-click `index.html` → **Open with Live Server**  
    *(Install the "Live Server" VS Code extension if not already installed)*
-3. The app opens at `http://127.0.0.1:5500`
+3. The app opens at Backend API: http://localhost:5000
 
 ---
 

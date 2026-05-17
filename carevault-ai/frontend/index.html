@@ -365,8 +365,8 @@
               <input type="text" id="upload-doctor" placeholder="e.g. Dr. Sharma, Apollo Hospital"/>
             </div>
             <div class="form-group">
-              <label><i class="fa-solid fa-align-left"></i> Description / Findings *</label>
-              <textarea id="upload-desc" rows="5" placeholder="Describe findings, diagnoses, medications, symptoms etc. The more detail you add, the better AI insights you get."></textarea>
+              <label><i class="fa-solid fa-align-left"></i> Description / Findings (optional)</label>
+              <textarea id="upload-desc" rows="5" placeholder="Add findings, diagnoses, medications, or symptoms if available."></textarea>
             </div>
             <div class="form-group">
               <label><i class="fa-solid fa-paperclip"></i> Attach File (optional)</label>
@@ -412,7 +412,10 @@
       <section id="patient-tab-insights" class="tab-section">
         <div class="section-top-row">
           <h2><i class="fa-solid fa-brain"></i> AI Health Insights</h2>
-          <button class="btn-primary" onclick="runAIAnalysis()"><i class="fa-solid fa-wand-magic-sparkles"></i> Analyze All Records</button>
+          <div class="section-actions">
+            <button class="btn-ghost" onclick="exportHealthSummary()"><i class="fa-solid fa-file-export"></i> Export Summary</button>
+            <button class="btn-primary" onclick="runAIAnalysis()"><i class="fa-solid fa-wand-magic-sparkles"></i> Analyze All Records</button>
+          </div>
         </div>
         <div id="insights-loader" class="insights-loader hidden">
           <div class="ai-loader-ring"></div>
